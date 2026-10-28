@@ -27,7 +27,7 @@ use crate::dist::pkg;
 use crate::lru_disk_cache::{LruCache, Meter};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
-use crate::util::{HashToDigest, OsStrExt, strip_basedirs_from_arg};
+use crate::util::{HashToDigest, OsStrExt, compile_basedirs, strip_basedirs_from_arg};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
 use filetime::FileTime;
@@ -1698,7 +1698,7 @@ where
         _cache_control: CacheControl,
     ) -> Result<HashResult<T>> {
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
-        let basedirs = storage.basedirs();
+        let basedirs = compile_basedirs(storage.basedirs(), &env_vars);
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
         let os_string_arguments: Vec<(OsString, Option<OsString>)> = self
             .parsed_args
@@ -1857,7 +1857,7 @@ where
                 .chain(sortables)
                 .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
                 .fold(OsString::new(), |mut a, b| {
-                    a.push(strip_basedirs_os(b, basedirs));
+                    a.push(strip_basedirs_os(b, &basedirs));
                     a
                 })
         };
@@ -1877,11 +1877,34 @@ where
         // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
+        //
+        //    A value the crate reads with `env!` can end up in its output (a test's
+        //    `env!("CARGO_MANIFEST_DIR")` fixture path, `env!("CARGO_BIN_EXE_x")`), so it
+        //    keeps its checkout path, except `OUT_DIR` and paths inside it: crates read
+        //    those to `include!` build-script output (`include!(env!("TYPENUM_BUILD_OP"))`),
+        //    whose contents are hashed as a source file above.
+        let out_dir = env_vars
+            .iter()
+            .find(|(k, _)| k == "OUT_DIR")
+            .map(|(_, v)| v.as_encoded_bytes());
+        let in_out_dir = |val: &OsStr| {
+            out_dir.is_some_and(|dir| {
+                let val = val.as_encoded_bytes();
+                val == dir
+                    || val.strip_prefix(dir).is_some_and(|rest| {
+                        rest.first().is_some_and(|c| std::path::is_separator(*c as char))
+                    })
+            })
+        };
         env_deps.sort();
         for (var, val) in env_deps.iter() {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            strip_basedirs_os(val, basedirs).hash(&mut HashToDigest { digest: &mut m });
+            if var == "OUT_DIR" || in_out_dir(val) {
+                strip_basedirs_os(val, &basedirs).hash(&mut HashToDigest { digest: &mut m });
+            } else {
+                val.hash(&mut HashToDigest { digest: &mut m });
+            }
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()
@@ -1912,10 +1935,10 @@ where
 
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            strip_basedirs_os(val, basedirs).hash(&mut HashToDigest { digest: &mut m });
+            strip_basedirs_os(val, &basedirs).hash(&mut HashToDigest { digest: &mut m });
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
-        Path::new(&strip_basedirs_os(cwd.as_os_str(), basedirs))
+        Path::new(&strip_basedirs_os(cwd.as_os_str(), &basedirs))
             .hash(&mut HashToDigest { digest: &mut m });
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
@@ -4345,7 +4368,7 @@ foo.rs:
     }
 
     /// An env-dep equal to a basedir is keyed apart from an unset one, which rustc
-    /// writes as `# env-dep:Y` for an `option_env!("Y")`.
+    /// writes as `# env-dep:OUT_DIR` for an `option_env!("OUT_DIR")`.
     #[test]
     fn test_hash_env_dep_equal_to_basedir_is_not_unset() {
         let f = TestFixture::new();
@@ -4365,12 +4388,108 @@ foo.rs:
                     "lib",
                 ],
                 &[],
-                &[("Y", val)],
+                &[("OUT_DIR", val)],
                 nothing,
                 MockStorage::new(None, false).with_basedirs(vec![basedir(&root)]),
             )
         };
         assert_ne!(key("".into()), key(root.clone().into()));
+    }
+
+    fn lib_args() -> Vec<OsString> {
+        [
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ]
+        .map(OsString::from)
+        .to_vec()
+    }
+
+    /// A path the crate reads with `env!` can be compiled into it (a fixture
+    /// path, `CARGO_BIN_EXE_*`), so it keeps two checkouts apart; the same
+    /// variable seen only in the environment does not.
+    #[test]
+    fn test_env_dep_paths_stay_checkout_specific() {
+        fn key(f: &TestFixture, env_dep: bool) -> String {
+            let root: OsString = f.tempdir.path().into();
+            let env_deps: Vec<(&str, OsString)> = if env_dep {
+                vec![("CARGO_MANIFEST_DIR", root.clone())]
+            } else {
+                vec![]
+            };
+            hash_key_with(
+                f,
+                &lib_args(),
+                &[("CARGO_MANIFEST_DIR".into(), root.clone())],
+                &env_deps,
+                nothing,
+                MockStorage::new(None, false).with_basedirs(vec![basedir(f.tempdir.path())]),
+            )
+        }
+
+        let a = TestFixture::new();
+        let b = TestFixture::new();
+        assert_eq!(key(&a, false), key(&b, false));
+        assert_ne!(key(&a, true), key(&b, true));
+    }
+
+    /// A build script can hand the crate a generated file in its `OUT_DIR` under
+    /// another name (`include!(env!("TYPENUM_BUILD_OP"))`); that path is stripped
+    /// like `OUT_DIR`. A path merely sharing its prefix is not.
+    #[test]
+    fn test_env_dep_paths_in_out_dir_are_stripped() {
+        fn key(f: &TestFixture, file: &str) -> String {
+            let root = f.tempdir.path();
+            let out_dir = root.join("target/build/foo-1/out");
+            let generated = format!("{}{file}", out_dir.display());
+            hash_key_with(
+                f,
+                &lib_args(),
+                &[("OUT_DIR".into(), out_dir.clone().into())],
+                &[("FOO_GENERATED", generated.into())],
+                nothing,
+                MockStorage::new(None, false).with_basedirs(vec![basedir(root)]),
+            )
+        }
+
+        let a = TestFixture::new();
+        let b = TestFixture::new();
+        assert_eq!(key(&a, "/op.rs"), key(&b, "/op.rs"));
+        assert_ne!(key(&a, "-sibling/op.rs"), key(&b, "-sibling/op.rs"));
+    }
+
+    /// `SCCACHE_CHECKOUT_DIR` in a compile's environment is a basedir for that
+    /// compile, for checkouts the server's `SCCACHE_BASEDIRS` does not list.
+    #[test]
+    fn test_checkout_dir_env_is_a_basedir() {
+        fn key(f: &TestFixture, checkout_dir: Option<OsString>) -> String {
+            let root: OsString = f.tempdir.path().into();
+            let mut env = vec![("CARGO_MANIFEST_DIR".into(), root.clone())];
+            env.extend(checkout_dir.map(|d| (OsString::from("SCCACHE_CHECKOUT_DIR"), d)));
+            hash_key_with(
+                f,
+                &lib_args(),
+                &env,
+                &[("OUT_DIR", f.tempdir.path().join("target/out").into())],
+                nothing,
+                MockStorage::new(None, false),
+            )
+        }
+
+        let a = TestFixture::new();
+        let b = TestFixture::new();
+        let own = |f: &TestFixture| Some(f.tempdir.path().into());
+        assert_ne!(key(&a, None), key(&b, None));
+        assert_eq!(key(&a, own(&a)), key(&b, own(&b)));
+        // A relative directory is ignored rather than stripped.
+        assert_eq!(key(&a, Some("relative".into())), key(&a, None));
     }
 
     #[test_case(true ; "with preprocessor cache")]

@@ -1326,6 +1326,28 @@ pub struct Config {
     pub client_side_mode: bool,
 }
 
+/// A basedir as the hashers compare against it: absolute, normalized (no double
+/// separators, `.` or `..`), with one trailing `/` so it only matches whole path
+/// components, and on Windows with slashes and lowercase.
+pub fn normalize_basedir(d: &str) -> Result<Vec<u8>> {
+    let p = Utf8TypedPathBuf::from(d);
+    if !p.is_absolute() {
+        bail!("Basedir path must be absolute: {:?}", p);
+    }
+    let mut bytes = p.normalize().to_string().into_bytes();
+    bytes.push(b'/');
+
+    #[cfg(target_os = "windows")]
+    {
+        Ok(normalize_win_path(&bytes))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(bytes)
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let env_conf = config_from_env()?;
@@ -1379,31 +1401,7 @@ impl Config {
         // basedirs_raw is Vec<PathBuf>
         let mut basedirs = Vec::with_capacity(basedirs_raw.len());
         for d in basedirs_raw {
-            let p = Utf8TypedPathBuf::from(d);
-            if !p.is_absolute() {
-                bail!("Basedir path must be absolute: {:?}", p);
-            }
-            // Normalize basedir:
-            // remove double separators, cur_dirs, parent_dirs, trailing slashes
-            let p_norm = p.normalize();
-            let mut bytes = p_norm.to_string().into_bytes();
-
-            // Always add a trailing `/` to basedirs to ensure we only match complete path
-            // components
-            bytes.push(b'/');
-
-            // normalize windows paths: use slashes and lowercase
-            let normalized = {
-                #[cfg(target_os = "windows")]
-                {
-                    normalize_win_path(&bytes)
-                }
-
-                #[cfg(not(target_os = "windows"))]
-                {
-                    bytes
-                }
-            };
+            let normalized = normalize_basedir(&d)?;
             // push only if not already present
             if !basedirs.contains(&normalized) {
                 basedirs.push(normalized);

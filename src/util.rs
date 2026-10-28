@@ -1225,6 +1225,36 @@ pub fn num_cpus() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
+/// The environment variable naming the checkout a compile belongs to, set per
+/// compile by a wrapper (e.g. to the repository root).
+pub const CHECKOUT_DIR_ENV: &str = "SCCACHE_CHECKOUT_DIR";
+
+/// The basedirs for one compile: the server's configured basedirs plus the
+/// compile's own `SCCACHE_CHECKOUT_DIR`, if set. `SCCACHE_BASEDIRS` is read once
+/// when the server starts, so it cannot name a checkout created later; the
+/// checkout dir comes with each compile's environment.
+pub fn compile_basedirs<'a>(
+    configured: &'a [Vec<u8>],
+    env_vars: &[(OsString, OsString)],
+) -> Cow<'a, [Vec<u8>]> {
+    let Some((_, dir)) = env_vars.iter().find(|(k, _)| k == CHECKOUT_DIR_ENV) else {
+        return Cow::Borrowed(configured);
+    };
+    let normalized = match dir.to_str().map(crate::config::normalize_basedir) {
+        Some(Ok(normalized)) => normalized,
+        _ => {
+            warn!("Ignoring {CHECKOUT_DIR_ENV}={dir:?}: not an absolute UTF-8 path");
+            return Cow::Borrowed(configured);
+        }
+    };
+    if configured.contains(&normalized) {
+        return Cow::Borrowed(configured);
+    }
+    let mut basedirs = configured.to_vec();
+    basedirs.push(normalized);
+    Cow::Owned(basedirs)
+}
+
 /// Strip base directories from absolute paths in preprocessor output.
 ///
 /// This function searches for basedir paths in the preprocessor output and

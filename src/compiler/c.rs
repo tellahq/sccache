@@ -27,7 +27,7 @@ use crate::dist::pkg;
 use crate::mock_command::CommandCreatorSync;
 use crate::util::{
     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
-    hash_all, strip_basedirs, strip_basedirs_from_arg,
+    compile_basedirs, hash_all, strip_basedirs, strip_basedirs_from_arg,
 };
 use async_trait::async_trait;
 use fs_err as fs;
@@ -406,6 +406,7 @@ where
     ) -> Result<HashResult<T>> {
         let start_of_compilation = std::time::SystemTime::now();
 
+        let basedirs = compile_basedirs(storage.basedirs(), &env_vars);
         let extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
         // The assembler that turns the compiler's output into the object file is
         // as much a part of the result as the compiler itself.
@@ -490,7 +491,7 @@ where
                 self.compiler.plusplus(),
                 self.parsed_args.is_multiarch(),
                 preprocessor_cache_mode_config,
-                storage.basedirs(),
+                &basedirs,
             )?
         } else {
             None
@@ -663,7 +664,7 @@ where
         .with_extra_hashes(&extra_hashes)
         .with_env_vars(&env_vars)
         .with_plusplus(self.compiler.plusplus())
-        .with_basedirs(storage.basedirs())
+        .with_basedirs(&basedirs)
         .with_assembler_digest(assembler_digest.as_deref())
         .compute();
 

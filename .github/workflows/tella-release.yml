@@ -1,0 +1,76 @@
+# Release binaries of the `tella` branch, for tella-fusion's
+# scripts/sccache/install.sh. Push a tag named v<upstream version>-tella.<n>.
+name: tella release
+
+on:
+  push:
+    tags: ["v*-tella.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ fromJson(matrix.container || '{"image":null}') }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            container: '{"image": "messense/rust-musl-cross:x86_64-musl"}'
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            container: '{"image": "messense/rust-musl-cross:aarch64-musl"}'
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install rust
+        if: ${{ !matrix.container }}
+        uses: ./.github/actions/rust-toolchain
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release --bin sccache --target ${{ matrix.target }} --features=openssl/vendored
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          CARGO_PROFILE_RELEASE_LTO: "true"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sccache-${{ github.ref_name }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/sccache
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+
+      - name: Package
+        run: |
+          for d in sccache-*; do
+            chmod +x "$d/sccache"
+            tar -zcf "$d.tar.gz" "$d"
+            sha256sum "$d.tar.gz" | cut -d' ' -f1 | tr -d '\n' > "$d.tar.gz.sha256"
+          done
+
+      - name: Create release
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes "The tella branch: upstream sccache plus path normalization for git worktrees." \
+            sccache-*.tar.gz sccache-*.tar.gz.sha256
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}

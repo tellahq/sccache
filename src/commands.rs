@@ -983,11 +983,14 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         } => {
             trace!("Command::Compile {{ {:?}, {:?}, {:?} }}", exe, cmdline, cwd);
 
+            // Incremental compiles are fine when they are cached as such.
+            let cache_incremental = env::var(crate::compiler::CACHE_INCREMENTAL_ENV)
+                .is_ok_and(|v| v == "1");
             let incr_env_strs = ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"];
             incr_env_strs
                 .iter()
                 .for_each(|incr_str| match env::var(incr_str) {
-                    Ok(incr_val) if incr_val == "1" => {
+                    Ok(incr_val) if incr_val == "1" && !cache_incremental => {
                         println!(
                             "sccache: incremental compilation is prohibited: Unset {} to continue.",
                             incr_str

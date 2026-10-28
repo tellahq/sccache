@@ -812,9 +812,12 @@ where
         &self,
         arguments: &[OsString],
         cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
+        env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        match parse_arguments(arguments, cwd) {
+        let cache_incremental = env_vars
+            .iter()
+            .any(|(k, v)| k == CACHE_INCREMENTAL_ENV && v == "1");
+        match parse_arguments_with(arguments, cwd, cache_incremental) {
             CompilerArguments::Ok(args) => CompilerArguments::Ok(Box::new(RustHasher {
                 executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
                 host: self.host.clone(),
@@ -1398,7 +1401,31 @@ impl Iterator for ExpandResponseFile<'_> {
     }
 }
 
+/// Set to `1` in a compile's environment to cache rustc compiles that pass
+/// `-C incremental`: the key leaves the flag out, a hit replaces the outputs
+/// (rustc's incremental state is left alone and stays valid: rustc compares
+/// against its own last session, not against the outputs on disk), and a miss
+/// runs rustc incrementally as asked and stores what it wrote.
+pub const CACHE_INCREMENTAL_ENV: &str = "SCCACHE_CACHE_INCREMENTAL";
+
+/// `-C incremental=…`, as a (flag, value) pair of the parsed arguments.
+fn is_incremental_arg(arg: &OsString, val: &Option<OsString>) -> bool {
+    arg == "-C"
+        && val
+            .as_ref()
+            .is_some_and(|v| v.as_encoded_bytes().starts_with(b"incremental="))
+}
+
+#[cfg(test)]
 fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<ParsedArguments> {
+    parse_arguments_with(arguments, cwd, false)
+}
+
+fn parse_arguments_with(
+    arguments: &[OsString],
+    cwd: &Path,
+    cache_incremental: bool,
+) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
     let mut emit: Option<HashSet<String>> = None;
@@ -1487,7 +1514,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                     // Longer-term we would like to figure out better integration between
                     // sccache and rustc in the incremental scenario:
                     // https://github.com/mozilla/sccache/issues/236
-                    ("incremental", _) => cannot_cache!("incremental"),
+                    ("incremental", _) if !cache_incremental => cannot_cache!("incremental"),
                     (_, _) => (),
                 }
             }
@@ -1717,7 +1744,8 @@ where
         let filtered_arguments = os_string_arguments
             .iter()
             .filter_map(|(arg, val)| {
-                if arg == "--emit" || arg == "--out-dir" {
+                // The dep-info run must not open rustc's incremental session.
+                if arg == "--emit" || arg == "--out-dir" || is_incremental_arg(arg, val) {
                     None
                 } else {
                     Some((arg, val))
@@ -1837,8 +1865,10 @@ where
                 // These contain paths which aren't relevant to the output, and the compiler inputs
                 // in those paths (rlibs and static libs used in the compilation) are used as hash
                 // inputs below.
-                .filter(|&(arg, _)| {
-                    !(arg == "--extern"
+                //   -C incremental, the directory of rustc's incremental session
+                .filter(|&(arg, val)| {
+                    !(is_incremental_arg(arg, val)
+                        || arg == "--extern"
                         || arg == "-L"
                         || arg == "--check-cfg"
                         || arg == "--out-dir"
@@ -3346,6 +3376,26 @@ LLVM version: 15.0.2
         assert_eq!(r, CompilerArguments::CannotCache("incremental", None));
     }
 
+    /// With `SCCACHE_CACHE_INCREMENTAL=1` an incremental compile is keyed as if
+    /// it had no `-C incremental`, in either spelling, wherever the session is.
+    #[test]
+    fn test_cache_incremental_key_ignores_the_session() {
+        let f = TestFixture::new();
+        let on = [(OsString::from(CACHE_INCREMENTAL_ENV), OsString::from("1"))];
+        let key = |extra: &[&str], env: &[(OsString, OsString)]| {
+            let mut args = lib_args();
+            args.extend(extra.iter().map(OsString::from));
+            hash_key_with(&f, &args, env, &[], nothing, MockStorage::new(None, false))
+        };
+
+        let plain = key(&[], &[]);
+        assert_eq!(key(&["-C", "incremental=/a/incremental"], &on), plain);
+        assert_eq!(key(&["-C", "incremental=/b/incremental"], &on), plain);
+        assert_eq!(key(&["-Cincremental=/c/incremental"], &on), plain);
+        // Other codegen options still count.
+        assert_ne!(key(&["-C", "incremental=/a", "-C", "opt-level=1"], &on), plain);
+    }
+
     #[test]
     fn test_parse_arguments_dep_info_no_extra_filename() {
         let h = parses!(
@@ -4255,7 +4305,10 @@ foo.rs:
             .iter()
             .map(|a| a.as_ref().to_owned())
             .collect::<Vec<OsString>>();
-        let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
+        let cache_incremental = env_vars
+            .iter()
+            .any(|(k, v)| k == CACHE_INCREMENTAL_ENV && v == "1");
+        let parsed_args = match parse_arguments_with(&oargs, f.tempdir.path(), cache_incremental) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
             o => panic!("Got unexpected parse result: {:?}", o),
         };
